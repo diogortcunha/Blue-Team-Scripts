@@ -85,10 +85,3 @@ python3 Python-Scripts/hashwatch_daemon.py /etc --interval 30
 - Output is meant for quick triage and follow-up investigation.
 - Not every check will work on every system because permissions and tooling vary by OS.
 
-## More Ideas
-
-- `process_tree_audit.py` - map parent and child process chains.
-- `network_allowlist_audit.py` - compare outbound destinations to an allowlist.
-- `registry_hunt.py` - search Windows registry locations for suspicious persistence.
-- `samba_share_audit.py` - review exposed SMB shares and permissions.
-- `ssh_config_audit.py` - inspect SSH hardening settings and recent changes.

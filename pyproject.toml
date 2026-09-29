@@ -1,0 +1,26 @@
+# Tooling configuration only: the scripts have no runtime dependencies and are run directly.
+
+[project]
+name = "blue-team-scripts"
+version = "2.1.0"
+description = "Blue-team host triage and defensive audit scripts"
+requires-python = ">=3.9"
+dependencies = []
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py39"
+line-length = 160
+src = ["Python-Scripts", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "I", "UP"]
+# Optional/PEP 604 annotations are fine: every module uses `from __future__ import annotations`.
+ignore = ["E501", "UP006", "UP007", "UP035", "UP045"]
+
+[tool.ruff.lint.isort]
+known-first-party = [
+    "btcommon", "conftest", "dns_cache_audit", "file_hash_audit", "suspicious_web_root_scan", "triage_all",
+]

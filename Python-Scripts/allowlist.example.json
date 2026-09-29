@@ -1,0 +1,23 @@
+{
+  "_comment": "Copy to allowlist.json (read automatically) or pass with --allowlist FILE. Matching findings become 'info' and no longer change the exit code. 'match' is a case-insensitive regex on the finding message; 'tool', 'check', 'host' (regex) and 'expires' (YYYY-MM-DD) are optional.",
+  "allowlist": [
+    {
+      "tool": "log_triage",
+      "check": "service_installed",
+      "match": "service=Google Updater",
+      "reason": "Chrome updater reinstalls its services on every update"
+    },
+    {
+      "tool": "port_watch",
+      "match": ":8888 .*jupyter",
+      "reason": "Jupyter on the data-science workstation",
+      "host": "^ds-ws-\\d+$"
+    },
+    {
+      "tool": "account_audit",
+      "match": "coc-admin is enabled with PASSWD_NOTREQD",
+      "reason": "Vendor account, ticket SEC-123; password confirmed set",
+      "expires": "2026-12-31"
+    }
+  ]
+}

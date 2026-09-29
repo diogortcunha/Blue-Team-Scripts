@@ -1,0 +1,241 @@
+{
+  "commands": {
+    "_comment": "Regexes (case-insensitive) for suspicious command lines. Shared by process, cron, scheduled task and autorun checks.",
+    "patterns": [
+      "(curl|wget)[^|;]*\\|\\s*(ba|z|da)?sh",
+      "(curl|wget)\\s.*https?://\\d{1,3}(\\.\\d{1,3}){3}",
+      "/dev/(tcp|udp)/",
+      "\\b(nc|ncat|netcat)\\b.*\\s-[a-z]*[ec]\\b",
+      "\\bbash\\s+-i\\b",
+      "\\bsocat\\b.*exec",
+      "python[23]?\\s+-c\\s.*(socket|pty|subprocess|base64)",
+      "perl\\s+-e\\s.*socket",
+      "base64\\s+(-d|--decode)",
+      "\\b(chmod\\s+\\+x|chmod\\s+[0-7]*7[0-7]*)\\s+/(tmp|dev/shm|var/tmp)/",
+      "(^|(?<!>)[;&|]\\s*|\\b(sh|bash|dash|zsh|python[23]?|perl|nohup|exec)\\s+(-c\\s+['\"]?)?)/(tmp|dev/shm|var/tmp)/\\S+",
+      "powershell(\\.exe)?\\s.*-(e|en|enc|enco|encodedcommand)\\s",
+      "powershell(\\.exe)?\\s.*(-w(indowstyle)?\\s+hidden|-nop\\b)",
+      "(iex|invoke-expression)\\s*\\(",
+      "downloadstring|downloadfile|net\\.webclient|invoke-webrequest|start-bitstransfer",
+      "frombase64string",
+      "\\bmshta(\\.exe)?\\s.*(https?:|javascript:|vbscript:)",
+      "\\bregsvr32(\\.exe)?\\s.*/i:https?",
+      "\\brundll32(\\.exe)?\\s.*(javascript:|\\\\\\\\|https?:)",
+      "\\bcertutil(\\.exe)?\\s.*-(urlcache|decode)",
+      "\\bbitsadmin(\\.exe)?\\s.*/transfer",
+      "\\\\(appdata\\\\local\\\\temp|users\\\\public|windows\\\\temp|programdata)\\\\[^\\\\]+\\.(exe|dll|ps1|vbs|js|bat|cmd|hta)"
+    ]
+  },
+  "process_monitor": {
+    "_comment": "Exact process names (without .exe) that deserve a second look whenever they run.",
+    "suspicious_names": [
+      "nc", "ncat", "netcat", "socat", "mshta", "wscript", "cscript", "regsvr32", "certutil",
+      "bitsadmin", "psexec", "psexesvc", "procdump", "mimikatz", "rclone", "ngrok", "chisel",
+      "plink", "xmrig", "minerd", "kworkerds", "masscan", "nmap"
+    ]
+  },
+  "process_tree_audit": {
+    "_comment": "A child from 'children' started by a parent from 'parents' is suspicious. Names are lower-case without .exe.",
+    "rules": [
+      {
+        "name": "office or document reader spawned a shell/LOLBin",
+        "severity": "high",
+        "parents": ["winword", "excel", "powerpnt", "outlook", "onenote", "msaccess", "mspub", "visio", "acrord32", "acrobat", "foxitreader", "soffice.bin", "libreoffice", "evince", "okular"],
+        "children": ["cmd", "powershell", "pwsh", "wscript", "cscript", "mshta", "rundll32", "regsvr32", "certutil", "bitsadmin", "msbuild", "installutil", "sh", "bash", "dash", "zsh", "python", "python3", "curl", "wget"]
+      },
+      {
+        "name": "web server spawned a shell (possible web shell)",
+        "severity": "high",
+        "parents": ["w3wp", "httpd", "apache2", "nginx", "php-fpm", "php-cgi", "php", "lighttpd", "tomcat", "tomcat9", "catalina", "caddy", "iisexpress"],
+        "children": ["cmd", "powershell", "pwsh", "sh", "bash", "dash", "zsh", "whoami", "id", "uname", "net", "net1", "ipconfig", "ifconfig", "nc", "ncat", "curl", "wget", "python", "python3", "perl"]
+      },
+      {
+        "name": "database server spawned a shell",
+        "severity": "high",
+        "parents": ["sqlservr", "mysqld", "mariadbd", "postgres", "mongod", "redis-server"],
+        "children": ["cmd", "powershell", "pwsh", "sh", "bash", "dash", "python", "python3", "curl", "wget"]
+      },
+      {
+        "name": "script host spawned a network or download tool",
+        "severity": "medium",
+        "parents": ["wscript", "cscript", "mshta"],
+        "children": ["powershell", "pwsh", "cmd", "certutil", "bitsadmin", "curl", "rundll32", "regsvr32"]
+      }
+    ],
+    "expected_parents": {
+      "_comment": "Windows system processes and the only parents they should have.",
+      "lsass": ["wininit"],
+      "services": ["wininit"],
+      "winlogon": ["smss"],
+      "wininit": ["smss"],
+      "svchost": ["services", "msmpeng"],
+      "taskhostw": ["svchost"],
+      "lsaiso": ["wininit"]
+    }
+  },
+  "deleted_binary_check": {
+    "suspicious_dirs": [
+      "^/tmp/", "^/var/tmp/", "^/dev/shm/", "^/run/user/\\d+/", "^/memfd:",
+      "\\\\appdata\\\\local\\\\temp\\\\", "\\\\windows\\\\temp\\\\", "\\\\users\\\\public\\\\",
+      "\\\\\\$recycle\\.bin\\\\", "\\\\programdata\\\\[^\\\\]+\\.exe$", "\\\\perflogs\\\\"
+    ]
+  },
+  "log_triage": {
+    "bruteforce_threshold": 10,
+    "linux_ignore": ["CRON\\[\\d+\\]: pam_unix\\(cron:session\\)", "pam_unix\\(systemd-user:session\\)", "pam_unix\\(cron:session\\)"],
+    "_comment": "First matching pattern wins, so put the more specific ones first.",
+    "linux_patterns": [
+      {"category": "sudo_failure", "severity": "medium", "pattern": "sudo:.*(incorrect password|not in sudoers|authentication failure)"},
+      {"category": "account_change", "severity": "medium", "pattern": "(useradd|userdel|usermod|groupadd|groupmod|gpasswd|chpasswd|new user|new group|delete user|password changed|add '.*' to group)"},
+      {"category": "auth_failure", "severity": "low", "pattern": "(failed password|invalid user|authentication failure|failed publickey|maximum authentication attempts|connection closed by authenticating user)"},
+      {"category": "root_login", "severity": "medium", "pattern": "accepted \\S+ for root from"},
+      {"category": "login", "severity": "info", "pattern": "(accepted (password|publickey|keyboard-interactive)|session opened for user)"},
+      {"category": "sudo", "severity": "info", "pattern": "sudo:.*command="},
+      {"category": "su", "severity": "info", "pattern": "\\bsu(\\[\\d+\\])?:.*(session opened|successful su)"}
+    ],
+    "windows_events": {
+      "Security": {
+        "1102": {"category": "log_cleared", "severity": "high", "description": "Security audit log was cleared"},
+        "4624": {"category": "login", "severity": "info", "description": "Successful logon"},
+        "4625": {"category": "auth_failure", "severity": "low", "description": "Failed logon"},
+        "4648": {"category": "explicit_credentials", "severity": "info", "description": "Logon with explicit credentials"},
+        "4672": {"category": "privileged_logon", "severity": "info", "description": "Special privileges assigned to new logon"},
+        "4720": {"category": "account_change", "severity": "medium", "description": "User account created"},
+        "4722": {"category": "account_change", "severity": "medium", "description": "User account enabled"},
+        "4724": {"category": "account_change", "severity": "medium", "description": "Password reset attempt"},
+        "4726": {"category": "account_change", "severity": "medium", "description": "User account deleted"},
+        "4728": {"category": "group_change", "severity": "medium", "description": "Member added to global security group"},
+        "4732": {"category": "group_change", "severity": "medium", "description": "Member added to local security group"},
+        "4756": {"category": "group_change", "severity": "medium", "description": "Member added to universal security group"},
+        "4740": {"category": "lockout", "severity": "medium", "description": "User account locked out"},
+        "4697": {"category": "service_installed", "severity": "medium", "description": "Service installed"},
+        "4698": {"category": "scheduled_task", "severity": "medium", "description": "Scheduled task created"}
+      },
+      "System": {
+        "104": {"category": "log_cleared", "severity": "high", "description": "Event log was cleared"},
+        "7045": {"category": "service_installed", "severity": "medium", "description": "Service installed"}
+      }
+    },
+    "interesting_logon_types": ["2", "3", "7", "10", "11"]
+  },
+  "port_watch": {
+    "_comment": "Listening ports commonly used by backdoors, C2 and reverse shells.",
+    "suspicious_ports": [1080, 1234, 1337, 2222, 3333, 4444, 4445, 5555, 6666, 6667, 6697, 7777, 8081, 8888, 9001, 9050, 9999, 12345, 31337, 50050]
+  },
+  "network_beacon_watch": {
+    "min_events": 4,
+    "max_jitter": 0.2,
+    "count_threshold": 10
+  },
+  "startup_audit": {
+    "linux_rc_files": [".bashrc", ".bash_profile", ".bash_login", ".profile", ".zshrc", ".zprofile", ".bash_logout"],
+    "windows_run_keys": [
+      "HKLM\\Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+      "HKLM\\Software\\Microsoft\\Windows\\CurrentVersion\\RunOnce",
+      "HKLM\\Software\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Run",
+      "HKLM\\Software\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\RunOnce",
+      "HKLM\\Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer\\Run",
+      "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+      "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\RunOnce",
+      "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer\\Run"
+    ]
+  },
+  "suspicious_web_root_scan": {
+    "roots": [
+      "/var/www", "/srv/www", "/srv/http", "/usr/share/nginx/html", "/usr/local/www",
+      "/opt/lampp/htdocs", "C:/inetpub/wwwroot", "C:/xampp/htdocs", "C:/wamp64/www"
+    ],
+    "script_extensions": [
+      ".php", ".php3", ".php4", ".php5", ".php7", ".phtml", ".phar", ".pht", ".inc", ".asp", ".aspx",
+      ".ashx", ".asmx", ".asa", ".cer", ".jsp", ".jspx", ".war", ".cfm", ".cgi", ".pl", ".py", ".shtml", ".sh"
+    ],
+    "image_extensions": [".jpg", ".jpeg", ".png", ".gif", ".bmp", ".ico", ".webp", ".svg"],
+    "max_read_bytes": 2000000,
+    "markers": [
+      {"severity": "high", "pattern": "eval\\s*\\(\\s*(base64_decode|gzinflate|gzuncompress|str_rot13|strrev|rawurldecode)"},
+      {"severity": "high", "pattern": "(system|shell_exec|passthru|exec|popen|proc_open|pcntl_exec|assert)\\s*\\(\\s*\\$_(get|post|request|cookie|server)"},
+      {"severity": "high", "pattern": "eval\\s*\\(\\s*\\$_(get|post|request|cookie)"},
+      {"severity": "high", "pattern": "preg_replace\\s*\\(\\s*['\"].*/e['\"]"},
+      {"severity": "high", "pattern": "create_function\\s*\\(.*\\$_(get|post|request)"},
+      {"severity": "high", "pattern": "(b374k|c99shell|r57shell|wso\\s*shell|filesman|p0wny|weevely|china\\s*chopper)"},
+      {"severity": "high", "pattern": "request\\.(item|form|querystring)\\s*\\[.*\\].*(eval|execute)"},
+      {"severity": "high", "pattern": "runtime\\.getruntime\\(\\)\\.exec\\s*\\(\\s*request\\.getparameter"},
+      {"severity": "medium", "pattern": "(processstartinfo|process\\.start)\\s*\\(.*(cmd\\.exe|powershell)"},
+      {"severity": "medium", "pattern": "\\$\\{?['\"]?_(get|post|request|cookie)['\"]?\\}?\\s*\\[[^\\]]+\\]\\s*\\("},
+      {"severity": "medium", "pattern": "move_uploaded_file\\s*\\(.*\\.(php|phtml|phar)"},
+      {"severity": "low", "pattern": "base64_decode\\s*\\(\\s*['\"][a-z0-9+/=]{200,}"}
+    ]
+  },
+  "browser_download_audit": {
+    "risky_extensions": [
+      ".exe", ".msi", ".msix", ".msixbundle", ".appx", ".appxbundle", ".bat", ".cmd", ".com", ".cpl", ".dll",
+      ".scr", ".pif", ".ps1", ".psm1", ".vbs", ".vbe", ".js", ".jse", ".wsf", ".wsh", ".hta", ".jar",
+      ".lnk", ".url", ".chm", ".iso", ".img", ".vhd", ".vhdx", ".one", ".xll", ".docm", ".xlsm", ".pptm",
+      ".reg", ".inf", ".sh", ".appimage", ".deb", ".rpm", ".run", ".elf", ".zip", ".rar", ".7z", ".cab"
+    ],
+    "decoy_extensions": [".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".txt", ".jpg", ".jpeg", ".png", ".mp4", ".mp3", ".zip", ".rtf", ".csv"],
+    "executable_extensions": [".exe", ".scr", ".com", ".pif", ".bat", ".cmd", ".js", ".vbs", ".hta", ".lnk", ".ps1", ".msi", ".jar", ".wsf", ".cpl"]
+  },
+  "dns_cache_audit": {
+    "_comment": "Domain suffixes often abused for C2, tunnelling or phishing; not malicious by themselves.",
+    "suspicious_suffixes": [
+      ".duckdns.org", ".no-ip.org", ".no-ip.biz", ".ddns.net", ".hopto.org", ".zapto.org", ".servebeer.com",
+      ".ngrok.io", ".ngrok-free.app", ".ngrok.app", ".trycloudflare.com", ".serveo.net", ".loca.lt",
+      ".pastebin.com", ".transfer.sh", ".onion", ".tk", ".top", ".xyz", ".interact.sh", ".oast.fun",
+      ".burpcollaborator.net", ".requestbin.net", ".webhook.site", ".dnslog.cn", ".ceye.io"
+    ],
+    "security_domain_keywords": ["windowsupdate", "update.microsoft", "defender", "wdcp", "smartscreen", "symantec", "norton", "mcafee", "kaspersky", "sophos", "eset", "bitdefender", "avast", "avg.com", "malwarebytes", "trendmicro", "crowdstrike", "sentinelone", "virustotal", "clamav"],
+    "entropy_threshold": 3.8,
+    "min_label_length": 16
+  },
+  "suid_audit": {
+    "_comment": "Binaries that give a root shell or file access when SUID (from GTFOBins).",
+    "gtfobins": [
+      "aria2c", "ash", "awk", "base64", "bash", "busybox", "cat", "chmod", "chown", "cp", "csh", "curl", "cut",
+      "dash", "dd", "diff", "docker", "ed", "emacs", "env", "expect", "find", "flock", "gawk", "gdb", "gimp",
+      "grep", "head", "ionice", "ip", "jjs", "jq", "ksh", "ld.so", "less", "logsave", "lua", "make", "mawk",
+      "more", "mv", "nano", "nawk", "nice", "nmap", "node", "nohup", "openssl", "perl", "php", "pico", "python",
+      "python2", "python3", "rlwrap", "rsync", "ruby", "run-parts", "rview", "rvim", "sed", "setarch", "sh",
+      "socat", "sort", "sqlite3", "ssh", "start-stop-daemon", "stdbuf", "strace", "systemctl", "tail", "tar",
+      "taskset", "tclsh", "tee", "time", "timeout", "unshare", "view", "vim", "vim.basic", "vim.tiny", "watch",
+      "wget", "xargs", "xxd", "zsh"
+    ],
+    "dangerous_capabilities": ["cap_setuid", "cap_setgid", "cap_dac_override", "cap_dac_read_search", "cap_sys_admin", "cap_sys_ptrace", "cap_sys_module", "cap_chown", "cap_fowner"],
+    "suspicious_dirs": ["/tmp", "/var/tmp", "/dev/shm", "/home", "/root", "/var/www", "/run/user"]
+  },
+  "ssh_key_audit": {
+    "min_rsa_bits": 2048,
+    "risky_options": ["command=", "environment=", "tunnel=", "permitopen=", "permitlisten="]
+  },
+  "account_audit": {
+    "nologin_shells": ["/usr/sbin/nologin", "/sbin/nologin", "/bin/false", "/usr/bin/false", "/bin/sync", "/usr/bin/nologin", "/sbin/shutdown", "/sbin/halt"],
+    "admin_groups": ["sudo", "wheel", "admin", "root"]
+  },
+  "powershell_logging_audit": {
+    "suspicious_patterns": [
+      "frombase64string", "(iex|invoke-expression)\\b", "downloadstring|downloaddata|downloadfile",
+      "net\\.webclient", "invoke-webrequest|\\biwr\\b", "invoke-mimikatz|sekurlsa|kerberos::",
+      "amsiutils|amsiinitfailed|amsi\\.dll", "virtualalloc|writeprocessmemory|createremotethread",
+      "reflection\\.assembly\\]::load", "-bxor", "set-mppreference.*(disable|exclusion)",
+      "add-mppreference.*exclusion", "\\[char\\]\\s*\\d+\\s*\\+\\s*\\[char\\]", "`[a-z]`[a-z]`",
+      "system\\.net\\.sockets\\.tcpclient", "invoke-shellcode|invoke-reflectivepeinjection|powersploit|empire",
+      "get-credential|convertto-securestring.*-asplaintext", "-(ep|exec|executionpolicy)\\s+bypass", "amsi\\w*\\s*bypass|bypass\\w*amsi"
+    ]
+  },
+  "wmi_persistence_audit": {
+    "benign_consumers": ["SCM Event Log Consumer"],
+    "default_security_packages": ["kerberos", "msv1_0", "schannel", "wdigest", "tspkg", "pku2u", "cloudap", "negoexts", "\"\"", ""],
+    "default_authentication_packages": ["msv1_0"]
+  },
+  "defender_status": {
+    "max_signature_age_days": 3
+  },
+  "tool_integrity_check": {
+    "_comment": "Binaries whose output the other checks trust.",
+    "posix_tools": ["ps", "ss", "netstat", "ls", "find", "top", "lsof", "who", "w", "last", "lastlog", "login", "sshd", "sudo", "su", "passwd", "systemctl", "journalctl", "crontab", "atq", "lsmod", "modprobe", "ip", "ifconfig", "kill", "pgrep", "pkill", "bash", "sh", "python3", "dpkg", "rpm", "getcap", "lsblk", "resolvectl", "nft", "iptables"],
+    "windows_tools": ["netstat", "tasklist", "cmd", "powershell", "reg", "schtasks", "sc", "wevtutil", "net", "net1", "whoami", "ipconfig", "route", "systeminfo", "secedit", "netsh", "certutil", "findstr", "taskkill", "query"]
+  },
+  "hash_reputation": {
+    "virustotal_min_detections": 3
+  }
+}

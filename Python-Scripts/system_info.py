@@ -1,572 +1,303 @@
-import platform
-import socket
-import subprocess
+#!/usr/bin/env python3
+
+"""Collect a system and security snapshot of the host for triage.
+
+The report is written to ``<ip>_<timestamp>.txt`` (or ``.json`` with ``--json``) with
+owner-only permissions, or to stdout with ``--output -``. Each section is collected on its
+own, so one failing command never loses the rest of the report. Shell history can contain
+secrets and is only collected with ``--include-history``.
+"""
+
+from __future__ import annotations
+
 import os
-import re
+import socket
+import sys
+import tempfile
 from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Callable
 
-def get_ip():
-    # Get the first non-loopback IP address
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+from btcommon import (
+    IS_WINDOWS,
+    SYSTEM,
+    Report,
+    file_mtime,
+    fmt_endpoint,
+    home_dirs,
+    is_dir,
+    list_sockets,
+    load_rules,
+    make_parser,
+    read_text,
+    run,
+    run_first,
+    run_powershell,
+    walk_files,
+    windows_events,
+)
+
+Section = Callable[[], str]
+
+
+def get_ip() -> str:
+    """First non-loopback IPv4 address (no packet is sent)."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        # Doesn't have to be reachable
-        s.connect(('10.255.255.255', 1))
-        IP = s.getsockname()[0]
-    except Exception:
-        IP = '127.0.0.1'
+        sock.connect(("10.255.255.255", 1))
+        return sock.getsockname()[0]
+    except OSError:
+        return "127.0.0.1"
     finally:
-        s.close()
-    return IP
+        sock.close()
 
-def save_to_file(filename, content):
-    with open(filename, 'w', encoding='utf-8') as f:
-        f.write(content)
 
-def get_system_info():
-    os_type = platform.system()
-    if os_type == 'Windows':
-        info = get_windows_info()
-    elif os_type == 'Linux':
-        info = get_linux_info()
-    elif os_type == 'FreeBSD':
-        info = get_freebsd_info()
-    else:
-        info = "Unsupported OS\n"
-    return info
+def cmd(*commands: list[str]) -> Section:
+    """Section that runs the first available command."""
+    return lambda: run_first(*commands).output
 
-def get_windows_info():
-    info = ''
-    info += '========== System Information ==========\n'
-    info += 'Operating System: ' + platform.platform() + '\n'
-    info += 'Hostname: ' + platform.node() + '\n'
-    info += '\n========== Installed Software ==========\n'
-    info += get_installed_software_windows()
-    info += '\n========== Running Services ==========\n'
-    info += get_running_services_windows()
-    info += '\n========== Open Ports ==========\n'
-    info += get_open_ports_windows()
-    info += '\n========== Network Configuration ==========\n'
-    info += get_network_config_windows()
-    info += '\n========== Users and Groups ==========\n'
-    info += get_users_groups_windows()
-    info += '\n========== Active Connections ==========\n'
-    info += get_active_connections_windows()
-    info += '\n========== Security Policies ==========\n'
-    info += get_security_policies_windows()
-    info += '\n========== Firewall Rules ==========\n'
-    info += get_firewall_rules_windows()
-    # Additional sections for APT501 detection
-    info += '\n========== Recent PowerShell and CMD Usage ==========\n'
-    info += get_recent_shell_usage_windows()
-    info += '\n========== Suspicious Recent Files ==========\n'
-    info += get_suspicious_recent_files_windows()
-    info += '\n========== Recent Account Changes ==========\n'
-    info += get_recent_account_changes_windows()
-    info += '\n========== Potential Web Shells ==========\n'
-    info += get_potential_webshells_windows()
-    info += '\n========== Active SMB Sessions ==========\n'
-    info += get_active_smb_sessions_windows()
-    info += '\n========== Proxy Settings ==========\n'
-    info += get_proxy_settings_windows()
-    return info
 
-def get_linux_info():
-    info = ''
-    info += '========== System Information ==========\n'
-    info += 'Operating System: ' + platform.platform() + '\n'
-    info += 'Hostname: ' + platform.node() + '\n'
-    info += '\n========== Installed Software ==========\n'
-    info += get_installed_software_linux()
-    info += '\n========== Running Services ==========\n'
-    info += get_running_services_linux()
-    info += '\n========== Open Ports ==========\n'
-    info += get_open_ports_linux()
-    info += '\n========== Network Configuration ==========\n'
-    info += get_network_config_linux()
-    info += '\n========== Users and Groups ==========\n'
-    info += get_users_groups_linux()
-    info += '\n========== Active Connections ==========\n'
-    info += get_active_connections_linux()
-    info += '\n========== Security Policies ==========\n'
-    info += get_security_policies_linux()
-    info += '\n========== Firewall Rules ==========\n'
-    info += get_firewall_rules_linux()
-    # Additional sections for APT501 detection
-    info += '\n========== Recent Shell History ==========\n'
-    info += get_recent_shell_history_linux()
-    info += '\n========== Suspicious Recent Files ==========\n'
-    info += get_suspicious_recent_files_linux()
-    info += '\n========== Recent Account Changes ==========\n'
-    info += get_recent_account_changes_linux()
-    info += '\n========== Potential Web Shells ==========\n'
-    info += get_potential_webshells_linux()
-    info += '\n========== Active SMB Sessions ==========\n'
-    info += get_active_smb_sessions_linux()
-    info += '\n========== Proxy Settings ==========\n'
-    info += get_proxy_settings_linux()
-    return info
+def ps_table(script: str) -> Section:
+    return lambda: run_powershell(f"{script} | Format-Table -AutoSize | Out-String -Width 250").output
 
-def get_freebsd_info():
-    info = ''
-    info += '========== System Information ==========\n'
-    info += 'Operating System: ' + platform.platform() + '\n'
-    info += 'Hostname: ' + platform.node() + '\n'
-    info += '\n========== Installed Software ==========\n'
-    info += get_installed_software_freebsd()
-    info += '\n========== Running Services ==========\n'
-    info += get_running_services_freebsd()
-    info += '\n========== Open Ports ==========\n'
-    info += get_open_ports_freebsd()
-    info += '\n========== Network Configuration ==========\n'
-    info += get_network_config_freebsd()
-    info += '\n========== Users and Groups ==========\n'
-    info += get_users_groups_freebsd()
-    info += '\n========== Active Connections ==========\n'
-    info += get_active_connections_freebsd()
-    info += '\n========== Security Policies ==========\n'
-    info += get_security_policies_freebsd()
-    info += '\n========== Firewall Rules ==========\n'
-    info += get_firewall_rules_freebsd()
-    # Additional sections for APT501 detection
-    info += '\n========== Recent Shell History ==========\n'
-    info += get_recent_shell_history_freebsd()
-    info += '\n========== Suspicious Recent Files ==========\n'
-    info += get_suspicious_recent_files_freebsd()
-    info += '\n========== Recent Account Changes ==========\n'
-    info += get_recent_account_changes_freebsd()
-    info += '\n========== Potential Web Shells ==========\n'
-    info += get_potential_webshells_freebsd()
-    info += '\n========== Active SMB Sessions ==========\n'
-    info += get_active_smb_sessions_freebsd()
-    info += '\n========== Proxy Settings ==========\n'
-    info += get_proxy_settings_freebsd()
-    return info
 
-# Windows Functions
-
-def get_installed_software_windows():
-    cmd = 'wmic product get Name, Version'
-    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True, text=True)
-    return result.stdout or result.stderr
-
-def get_running_services_windows():
-    cmd = 'tasklist /svc'
-    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True, text=True)
-    return result.stdout or result.stderr
-
-def get_open_ports_windows():
-    cmd = 'netstat -ano'
-    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True, text=True)
-    return result.stdout or result.stderr
-
-def get_network_config_windows():
-    cmd = 'ipconfig /all'
-    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True, text=True)
-    return result.stdout or result.stderr
-
-def get_users_groups_windows():
-    cmd_users = 'net user'
-    result_users = subprocess.run(cmd_users, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True, text=True)
-    cmd_groups = 'net localgroup'
-    result_groups = subprocess.run(cmd_groups, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True, text=True)
-    return 'Users:\n' + (result_users.stdout or result_users.stderr) + '\nGroups:\n' + (result_groups.stdout or result_groups.stderr)
-
-def get_active_connections_windows():
-    cmd = 'netstat -an'
-    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True, text=True)
-    return result.stdout or result.stderr
-
-def get_security_policies_windows():
-    # Export security policies to a temporary file
-    cmd = 'secedit /export /cfg secedit_tmp.inf'
-    subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True, text=True)
-    try:
-        with open('secedit_tmp.inf', 'r', encoding='utf-16') as f:
-            data = f.read()
-    except Exception as e:
-        data = f"Could not read security policies: {e}\n"
-    finally:
-        if os.path.exists('secedit_tmp.inf'):
-            os.remove('secedit_tmp.inf')
-    return data
-
-def get_firewall_rules_windows():
-    cmd = 'netsh advfirewall firewall show rule name=all'
-    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True, text=True)
-    return result.stdout or result.stderr
-
-def get_recent_shell_usage_windows():
-    info = ''
-    # Get the last 7 days of PowerShell and CMD logs
-    cmd = 'wevtutil qe "Windows PowerShell" /q:"*[System[(TimeCreated[timediff(@SystemTime) <= 604800000])]]" /f:text'
-    result_ps = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True, text=True)
-    info += 'PowerShell Logs:\n' + (result_ps.stdout or result_ps.stderr) + '\n'
-    cmd = 'wevtutil qe "Microsoft-Windows-Cmd/Operational" /q:"*[System[(TimeCreated[timediff(@SystemTime) <= 604800000])]]" /f:text'
-    result_cmd = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True, text=True)
-    info += 'CMD Logs:\n' + (result_cmd.stdout or result_cmd.stderr)
-    return info
-
-def get_suspicious_recent_files_windows():
-    # Look for recent files in Downloads and Temp directories
-    paths = [os.environ.get('USERPROFILE') + '\\Downloads', os.environ.get('TEMP')]
-    info = ''
-    now = datetime.now()
-    for path in paths:
-        if os.path.exists(path):
-            info += f'Files in {path} modified in the last 7 days:\n'
-            for root, dirs, files in os.walk(path):
-                for file in files:
-                    filepath = os.path.join(root, file)
-                    try:
-                        mtime = datetime.fromtimestamp(os.path.getmtime(filepath))
-                        if (now - mtime) < timedelta(days=7):
-                            info += f'{filepath} - Last Modified: {mtime}\n'
-                    except Exception as e:
-                        info += f'Error accessing {filepath}: {e}\n'
-    return info
-
-def get_recent_account_changes_windows():
-    cmd = 'net user'
-    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True, text=True)
-    users = re.findall(r'\b\w+\b', result.stdout)
-    info = ''
-    for user in users:
-        cmd = f'net user {user}'
-        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True, text=True)
-        match = re.search(r'Account active\s+(\w+)', result.stdout)
-        if match:
-            info += f'User: {user}, Account Active: {match.group(1)}\n'
-    return info
-
-def get_potential_webshells_windows():
-    # Check common web directories for files modified in the last 7 days
-    paths = ['C:\\inetpub\\wwwroot', 'C:\\xampp\\htdocs']
-    info = ''
-    now = datetime.now()
-    for path in paths:
-        if os.path.exists(path):
-            info += f'Files in {path} modified in the last 7 days:\n'
-            for root, dirs, files in os.walk(path):
-                for file in files:
-                    if file.endswith(('.asp', '.aspx', '.php', '.jsp')):
-                        filepath = os.path.join(root, file)
-                        try:
-                            mtime = datetime.fromtimestamp(os.path.getmtime(filepath))
-                            if (now - mtime) < timedelta(days=7):
-                                info += f'{filepath} - Last Modified: {mtime}\n'
-                        except Exception as e:
-                            info += f'Error accessing {filepath}: {e}\n'
-    return info
-
-def get_active_smb_sessions_windows():
-    cmd = 'net session'
-    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True, text=True)
-    return result.stdout or result.stderr
-
-def get_proxy_settings_windows():
-    cmd = 'netsh winhttp show proxy'
-    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True, text=True)
-    return result.stdout or result.stderr
-
-# Linux Functions
-
-def get_installed_software_linux():
-    if os.path.exists('/usr/bin/dpkg'):
-        cmd = 'dpkg -l'
-    elif os.path.exists('/usr/bin/rpm'):
-        cmd = 'rpm -qa'
-    else:
-        return 'Package manager not detected.\n'
-    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True, text=True)
-    return result.stdout or result.stderr
-
-def get_running_services_linux():
-    cmd = 'systemctl list-units --type=service --state=running'
-    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True, text=True)
-    return result.stdout or result.stderr
-
-def get_open_ports_linux():
-    cmd = 'netstat -tuln'
-    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True, text=True)
-    if 'command not found' in result.stderr:
-        cmd = 'ss -tuln'
-        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True, text=True)
-    return result.stdout or result.stderr
-
-def get_network_config_linux():
-    cmd = 'ifconfig -a'
-    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True, text=True)
-    if 'command not found' in result.stderr:
-        cmd = 'ip addr show'
-        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True, text=True)
-    return result.stdout or result.stderr
-
-def get_users_groups_linux():
-    try:
-        with open('/etc/passwd', 'r') as f:
-            passwd = f.read()
-        with open('/etc/group', 'r') as f:
-            group = f.read()
-        return 'Users (/etc/passwd):\n' + passwd + '\nGroups (/etc/group):\n' + group
-    except Exception as e:
-        return f"Could not read users/groups: {e}\n"
-
-def get_active_connections_linux():
-    cmd = 'netstat -an'
-    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True, text=True)
-    if 'command not found' in result.stderr:
-        cmd = 'ss -an'
-        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True, text=True)
-    return result.stdout or result.stderr
-
-def get_security_policies_linux():
-    if os.path.exists('/usr/sbin/sestatus'):
-        cmd = 'sestatus'
-        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True, text=True)
-        return result.stdout or result.stderr
-    else:
-        return 'SELinux not installed or not enabled.\n'
-
-def get_firewall_rules_linux():
-    cmd = 'iptables -L -n -v'
-    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True, text=True)
-    if result.returncode != 0:
-        cmd = 'firewall-cmd --list-all'
-        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True, text=True)
-    return result.stdout or result.stderr
-
-def get_recent_shell_history_linux():
-    info = ''
-    # Read shell history
-    home_dirs = [os.path.join('/home', d) for d in os.listdir('/home')]
-    for home in home_dirs:
-        history_file = os.path.join(home, '.bash_history')
-        if os.path.exists(history_file):
-            info += f'History for {home}:\n'
-            try:
-                with open(history_file, 'r') as f:
-                    info += f.read() + '\n'
-            except Exception as e:
-                info += f'Error reading {history_file}: {e}\n'
-    return info
-
-def get_suspicious_recent_files_linux():
-    # Look for recent files in Downloads and /tmp directories
-    paths = ['/tmp', '/var/tmp']
-    home_dirs = [os.path.join('/home', d, 'Downloads') for d in os.listdir('/home')]
-    paths.extend(home_dirs)
-    info = ''
-    now = datetime.now()
-    for path in paths:
-        if os.path.exists(path):
-            info += f'Files in {path} modified in the last 7 days:\n'
-            for root, dirs, files in os.walk(path):
-                for file in files:
-                    filepath = os.path.join(root, file)
-                    try:
-                        mtime = datetime.fromtimestamp(os.path.getmtime(filepath))
-                        if (now - mtime) < timedelta(days=7):
-                            info += f'{filepath} - Last Modified: {mtime}\n'
-                    except Exception as e:
-                        info += f'Error accessing {filepath}: {e}\n'
-    return info
-
-def get_recent_account_changes_linux():
-    cmd = 'lastlog -t 7'
-    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True, text=True)
-    return result.stdout or result.stderr
-
-def get_potential_webshells_linux():
-    # Check common web directories for files modified in the last 7 days
-    paths = ['/var/www/html', '/usr/share/nginx/html']
-    info = ''
-    now = datetime.now()
-    for path in paths:
-        if os.path.exists(path):
-            info += f'Files in {path} modified in the last 7 days:\n'
-            for root, dirs, files in os.walk(path):
-                for file in files:
-                    if file.endswith(('.php', '.jsp', '.asp', '.aspx')):
-                        filepath = os.path.join(root, file)
-                        try:
-                            mtime = datetime.fromtimestamp(os.path.getmtime(filepath))
-                            if (now - mtime) < timedelta(days=7):
-                                info += f'{filepath} - Last Modified: {mtime}\n'
-                        except Exception as e:
-                            info += f'Error accessing {filepath}: {e}\n'
-    return info
-
-def get_active_smb_sessions_linux():
-    cmd = 'smbstatus --shares'
-    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True, text=True)
-    return result.stdout or result.stderr
-
-def get_proxy_settings_linux():
-    # Check environment variables for proxy settings
-    proxy_vars = ['http_proxy', 'https_proxy', 'ftp_proxy', 'no_proxy']
-    info = ''
-    for var in proxy_vars:
-        value = os.environ.get(var)
-        if value:
-            info += f'{var}={value}\n'
-    return info
-
-# FreeBSD Functions
-
-def get_installed_software_freebsd():
-    cmd = 'pkg info'
-    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True, text=True)
-    if result.returncode != 0:
-        return 'Could not retrieve installed packages.\n' + (result.stderr or '')
-    return result.stdout
-
-def get_running_services_freebsd():
-    cmd = 'service -e'
-    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True, text=True)
-    return result.stdout or result.stderr
-
-def get_open_ports_freebsd():
-    cmd = 'sockstat -4 -l'
-    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True, text=True)
-    return result.stdout or result.stderr
-
-def get_network_config_freebsd():
-    cmd = 'ifconfig -a'
-    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True, text=True)
-    return result.stdout or result.stderr
-
-def get_users_groups_freebsd():
-    try:
-        with open('/etc/passwd', 'r') as f:
-            passwd = f.read()
-        with open('/etc/group', 'r') as f:
-            group = f.read()
-        return 'Users (/etc/passwd):\n' + passwd + '\nGroups (/etc/group):\n' + group
-    except Exception as e:
-        return f"Could not read users/groups: {e}\n"
-
-def get_active_connections_freebsd():
-    cmd = 'netstat -an'
-    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True, text=True)
-    return result.stdout or result.stderr
-
-def get_security_policies_freebsd():
-    cmd = 'sysctl security'
-    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True, text=True)
-    return result.stdout or result.stderr
-
-def get_firewall_rules_freebsd():
-    # Check for pf firewall rules
-    cmd = 'pfctl -sr'
-    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True, text=True)
-    if result.returncode == 0:
-        return result.stdout
-    else:
-        # Check for ipfw firewall rules
-        cmd = 'ipfw list'
-        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True, text=True)
-    return result.stdout or result.stderr
-
-def get_recent_shell_history_freebsd():
-    info = ''
-    # Read shell history
-    home_dirs = [os.path.join('/home', d) for d in os.listdir('/home') if os.path.isdir(os.path.join('/home', d))]
-    for home in home_dirs:
-        history_files = ['.bash_history', '.sh_history', '.cshrc', '.zsh_history']
-        for hist_file in history_files:
-            history_path = os.path.join(home, hist_file)
-            if os.path.exists(history_path):
-                info += f'History file {hist_file} for {home}:\n'
-                try:
-                    with open(history_path, 'r') as f:
-                        info += f.read() + '\n'
-                except Exception as e:
-                    info += f'Error reading {history_path}: {e}\n'
-    return info
-
-def get_suspicious_recent_files_freebsd():
-    # Look for recent files in /tmp and user Downloads directories
-    paths = ['/tmp', '/var/tmp']
-    home_dirs = [os.path.join('/home', d, 'Downloads') for d in os.listdir('/home') if os.path.isdir(os.path.join('/home', d))]
-    paths.extend(home_dirs)
-    info = ''
-    now = datetime.now()
-    for path in paths:
-        if os.path.exists(path):
-            info += f'Files in {path} modified in the last 7 days:\n'
-            for root, dirs, files in os.walk(path):
-                for file in files:
-                    filepath = os.path.join(root, file)
-                    try:
-                        mtime = datetime.fromtimestamp(os.path.getmtime(filepath))
-                        if (now - mtime) < timedelta(days=7):
-                            info += f'{filepath} - Last Modified: {mtime}\n'
-                    except Exception as e:
-                        info += f'Error accessing {filepath}: {e}\n'
-    return info
-
-def get_recent_account_changes_freebsd():
-    cmd = 'last -n 100'
-    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True, text=True)
-    info = 'Recent logins (last 7 days):\n'
-    now = datetime.now()
-    for line in result.stdout.splitlines():
-        match = re.match(r'^(\w+)\s', line)
-        if match:
-            username = match.group(1)
-            # Extract date string from line
-            date_str = ' '.join(line.split()[-4:])
-            try:
-                log_time = datetime.strptime(date_str, '%a %b %d %H:%M:%S %Y')
-                if (now - log_time) < timedelta(days=7):
-                    info += line + '\n'
-            except Exception:
+def sockets_section(listening: bool) -> Section:
+    def collect() -> str:
+        sockets, error = list_sockets()
+        if error:
+            return error
+        lines = []
+        for sock in sockets:
+            if sock.listening != listening:
                 continue
-    return info
+            remote = "" if listening else f" -> {fmt_endpoint(sock.remote_addr, sock.remote_port)} {sock.state}"
+            lines.append(f"{sock.proto:<4} {fmt_endpoint(sock.local_addr, sock.local_port)}{remote} {sock.process or ''} {sock.pid or ''}".rstrip())
+        return "\n".join(sorted(lines))
+    return collect
 
-def get_potential_webshells_freebsd():
-    # Check common web directories for files modified in the last 7 days
-    paths = ['/usr/local/www/apache24/data', '/usr/local/www/nginx']
-    info = ''
-    now = datetime.now()
-    for path in paths:
-        if os.path.exists(path):
-            info += f'Files in {path} modified in the last 7 days:\n'
-            for root, dirs, files in os.walk(path):
-                for file in files:
-                    if file.endswith(('.php', '.jsp', '.asp', '.aspx')):
-                        filepath = os.path.join(root, file)
-                        try:
-                            mtime = datetime.fromtimestamp(os.path.getmtime(filepath))
-                            if (now - mtime) < timedelta(days=7):
-                                info += f'{filepath} - Last Modified: {mtime}\n'
-                        except Exception as e:
-                            info += f'Error accessing {filepath}: {e}\n'
-    return info
 
-def get_active_smb_sessions_freebsd():
-    cmd = 'smbstatus'
-    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True, text=True)
-    if 'command not found' in result.stderr:
-        return 'SMB not installed or smbstatus command not found.\n'
-    return result.stdout or result.stderr
+def recent_files(dirs: list[Path], days: int = 7, limit: int = 300) -> Section:
+    def collect() -> str:
+        cutoff = datetime.now() - timedelta(days=days)
+        lines = []
+        for path in walk_files([d for d in dirs if is_dir(d)]):
+            changed = file_mtime(path)
+            if changed and changed >= cutoff:
+                lines.append(f"{changed:%Y-%m-%d %H:%M}  {path}")
+        lines.sort(reverse=True)
+        extra = [f"... {len(lines) - limit} more"] if len(lines) > limit else []
+        return "\n".join(lines[:limit] + extra) or f"no files changed in the last {days} days"
+    return collect
 
-def get_proxy_settings_freebsd():
-    # Check environment variables for proxy settings
-    proxy_vars = ['http_proxy', 'https_proxy', 'ftp_proxy', 'no_proxy']
-    info = ''
-    for var in proxy_vars:
-        value = os.environ.get(var)
-        if value:
-            info += f'{var}={value}\n'
-    return info
 
-def main():
-    ip = get_ip()
-    filename = ip.replace('.', '_') + '.txt'
-    content = get_system_info()
-    save_to_file(filename, content)
-    print(f"System information saved to {filename}")
+def web_shells() -> str:
+    import re
 
-if __name__ == '__main__':
-    main()
+    from suspicious_web_root_scan import scan_file
+
+    rules = load_rules("suspicious_web_root_scan")
+    rules["script_extensions"] = set(rules.get("script_extensions", []))
+    rules["image_extensions"] = set(rules.get("image_extensions", []))
+    markers = [(re.compile(m["pattern"], re.IGNORECASE), m["severity"]) for m in rules.get("markers", [])]
+    cutoff = datetime.now() - timedelta(days=7)
+    roots = [Path(r) for r in rules.get("roots", []) if is_dir(r)]
+    lines = []
+    for path in walk_files(roots):
+        hit = scan_file(path, rules, markers, cutoff)
+        if hit:
+            lines.append(f"[{hit[0].upper()}] {path}: {hit[1]}")
+    return "\n".join(lines) or ("no web roots found" if not roots else "nothing suspicious")
+
+
+def shell_history(lines_per_file: int) -> Section:
+    names = [".bash_history", ".zsh_history", ".sh_history", ".history", ".python_history", ".mysql_history", ".psql_history"]
+    win = [r"AppData\Roaming\Microsoft\Windows\PowerShell\PSReadLine\ConsoleHost_history.txt"]
+
+    def collect() -> str:
+        out = []
+        for home in home_dirs():
+            for name in (win if IS_WINDOWS else names):
+                text = read_text(home / name)
+                if text:
+                    tail = text.splitlines()[-lines_per_file:]
+                    out.append(f"--- {home / name} (last {len(tail)} lines)\n" + "\n".join(tail))
+        return "\n".join(out) or "no readable history files"
+    return collect
+
+
+def proxy_env() -> str:
+    lines = [f"{k}={v}" for k, v in os.environ.items() if k.lower() in {"http_proxy", "https_proxy", "ftp_proxy", "all_proxy", "no_proxy"}]
+    for line in (read_text("/etc/environment") or "").splitlines():
+        if "proxy" in line.lower():
+            lines.append(f"/etc/environment: {line}")
+    return "\n".join(lines) or "no proxy configured"
+
+
+def users_linux() -> str:
+    shells = set(load_rules("account_audit").get("nologin_shells", []))
+    out = ["Accounts with a login shell:"]
+    for line in (read_text("/etc/passwd") or "").splitlines():
+        parts = line.split(":")
+        if len(parts) >= 7 and parts[6] not in shells:
+            out.append(f"  {parts[0]} uid={parts[2]} home={parts[5]} shell={parts[6]}")
+    out.append("Groups with members:")
+    for line in (read_text("/etc/group") or "").splitlines():
+        parts = line.split(":")
+        if len(parts) >= 4 and parts[3]:
+            out.append(f"  {parts[0]}: {parts[3]}")
+    return "\n".join(out)
+
+
+def windows_security_policy() -> str:
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = Path(tmp) / "secedit.inf"
+        result = run(["secedit", "/export", "/cfg", str(cfg), "/quiet"])
+        try:
+            return cfg.read_text(encoding="utf-16")
+        except OSError as exc:
+            return f"could not export security policy: {result.stderr or exc}"
+
+
+def windows_account_events() -> str:
+    events, error = windows_events("Security", [4720, 4722, 4725, 4726, 4738, 4732, 4728], days=7)
+    if error:
+        return error
+    return "\n".join(f"{e.time} [{e.id}] {e.summary} target={e.field('TargetUserName')} by={e.field('SubjectUserName')}" for e in events) or "none in the last 7 days"
+
+
+def windows_sections(args) -> list[tuple[str, Section]]:
+    temp = Path(os.environ.get("TEMP", tempfile.gettempdir()))
+    sections: list[tuple[str, Section]] = [
+        ("System Information", cmd(["systeminfo"])),
+        ("Installed Software", ps_table(
+            "Get-ItemProperty HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*, "
+            "HKLM:\\Software\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*, "
+            "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\* -ErrorAction SilentlyContinue | "
+            "Where-Object DisplayName | Sort-Object DisplayName | Select-Object DisplayName,DisplayVersion,Publisher,InstallDate")),
+        ("Running Services", ps_table("Get-CimInstance Win32_Service | Where-Object State -eq 'Running' | Sort-Object Name | Select-Object Name,StartMode,StartName,PathName")),
+        ("Listening Ports", sockets_section(True)),
+        ("Active Connections", sockets_section(False)),
+        ("Network Configuration", cmd(["ipconfig", "/all"])),
+        ("Routes", cmd(["route", "print"])),
+        ("Local Users", ps_table("Get-LocalUser | Select-Object Name,Enabled,LastLogon,PasswordRequired,PasswordExpires")),
+        ("Administrators", cmd(["net", "localgroup", "administrators"])),
+        ("Account Policy", cmd(["net", "accounts"])),
+        ("Security Policy", windows_security_policy),
+        ("Firewall Profiles", cmd(["netsh", "advfirewall", "show", "allprofiles"])),
+        ("Firewall Rules", cmd(["netsh", "advfirewall", "firewall", "show", "rule", "name=all"])),
+        ("Recent Account Changes (7 days)", windows_account_events),
+        ("Recent Files (Downloads, Temp)", recent_files([h / "Downloads" for h in home_dirs()] + [temp])),
+        ("Potential Web Shells", web_shells),
+        ("SMB Sessions", cmd(["net", "session"])),
+        ("SMB Shares", cmd(["net", "share"])),
+        ("Proxy Settings", lambda: run(["netsh", "winhttp", "show", "proxy"]).output + "\n" + proxy_env()),
+    ]
+    if args.include_history:
+        sections.append(("PowerShell History", shell_history(args.history_lines)))
+    return sections
+
+
+def linux_sections(args) -> list[tuple[str, Section]]:
+    downloads = [h / "Downloads" for h in home_dirs()]
+    sections: list[tuple[str, Section]] = [
+        ("System Information", lambda: "\n".join(filter(None, [
+            f"Hostname: {socket.gethostname()}",
+            run(["uname", "-a"]).output,
+            (read_text("/etc/os-release") or "").strip(),
+            "Uptime: " + run_first(["uptime", "-p"], ["uptime"]).output,
+        ]))),
+        ("Logged-in Users", cmd(["who", "-a"])),
+        ("Installed Software", cmd(["dpkg-query", "-W", "-f", "${Package} ${Version}\\n"], ["rpm", "-qa"], ["pacman", "-Q"], ["apk", "info", "-v"])),
+        ("Running Services", cmd(["systemctl", "list-units", "--type=service", "--state=running", "--no-pager", "--plain", "--no-legend"])),
+        ("Listening Ports", sockets_section(True)),
+        ("Active Connections", sockets_section(False)),
+        ("Network Configuration", cmd(["ip", "addr", "show"], ["ifconfig", "-a"])),
+        ("Routes", cmd(["ip", "route"], ["netstat", "-rn"])),
+        ("Users and Groups", users_linux),
+        ("Mandatory Access Control", cmd(["sestatus"], ["aa-status"])),
+        ("Firewall", cmd(["nft", "list", "ruleset"], ["iptables", "-S"], ["ufw", "status", "verbose"], ["firewall-cmd", "--list-all"])),
+        ("Recent Logins", cmd(["last", "-n", "30", "-w"])),
+        ("Recent Files (/tmp, /var/tmp, /dev/shm, Downloads)", recent_files([Path("/tmp"), Path("/var/tmp"), Path("/dev/shm")] + downloads)),
+        ("Potential Web Shells", web_shells),
+        ("SMB Sessions", cmd(["smbstatus", "-b"])),
+        ("Proxy Settings", proxy_env),
+    ]
+    if args.include_history:
+        sections.append(("Shell History", shell_history(args.history_lines)))
+    return sections
+
+
+def freebsd_sections(args) -> list[tuple[str, Section]]:
+    sections: list[tuple[str, Section]] = [
+        ("System Information", cmd(["uname", "-a"])),
+        ("Installed Software", cmd(["pkg", "info"])),
+        ("Enabled Services", cmd(["service", "-e"])),
+        ("Listening Ports", cmd(["sockstat", "-46l"])),
+        ("Active Connections", cmd(["sockstat", "-46c"])),
+        ("Network Configuration", cmd(["ifconfig", "-a"])),
+        ("Users and Groups", users_linux),
+        ("Security Settings", cmd(["sysctl", "security"])),
+        ("Firewall", cmd(["pfctl", "-sr"], ["ipfw", "list"])),
+        ("Recent Logins", cmd(["last", "-n", "30"])),
+        ("Recent Files (/tmp, /var/tmp)", recent_files([Path("/tmp"), Path("/var/tmp")] + [h / "Downloads" for h in home_dirs()])),
+        ("Potential Web Shells", web_shells),
+        ("SMB Sessions", cmd(["smbstatus", "-b"])),
+        ("Proxy Settings", proxy_env),
+    ]
+    if args.include_history:
+        sections.append(("Shell History", shell_history(args.history_lines)))
+    return sections
+
+
+def write_private(path: Path, text: str) -> None:
+    """Write a file readable only by its owner (the report can contain sensitive data)."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(text)
+
+
+def main() -> int:
+    parser = make_parser("Collect a system and security snapshot.")
+    parser.add_argument("--output", help="Output file, or '-' for stdout (default: <ip>_<timestamp>.txt/.json)")
+    parser.add_argument("--include-history", action="store_true", help="Include shell/PowerShell history (may contain secrets)")
+    parser.add_argument("--history-lines", type=int, default=100, help="History lines per file (default: 100)")
+    parser.add_argument("--section", action="append", help="Only collect sections whose title contains this text (repeatable)")
+    args = parser.parse_args()
+    report = Report("system_info", args, needs_admin=True)
+
+    if IS_WINDOWS:
+        sections = windows_sections(args)
+    elif SYSTEM == "FreeBSD":
+        sections = freebsd_sections(args)
+    else:
+        sections = linux_sections(args)
+    if args.section:
+        wanted = [s.lower() for s in args.section]
+        sections = [(title, fn) for title, fn in sections if any(w in title.lower() for w in wanted)]
+
+    for title, collect in sections:
+        print(f"collecting: {title}", file=sys.stderr)
+        try:
+            text = collect() or "(no output)"
+        except Exception as exc:  # one broken section must not lose the whole report
+            text = f"section failed: {type(exc).__name__}: {exc}"
+            report.error(f"{title}: {text}")
+        report.info(title, text.rstrip())
+
+    output = args.output or f"{get_ip().replace('.', '_')}_{datetime.now():%Y%m%d-%H%M%S}.{'json' if args.json else 'txt'}"
+    if output == "-":
+        return report.emit()
+
+    from contextlib import redirect_stdout
+    from io import StringIO
+
+    buffer = StringIO()
+    with redirect_stdout(buffer):
+        code = report.emit()
+    write_private(Path(output), buffer.getvalue())
+    print(f"System information saved to {output}", file=sys.stderr)
+    return code
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

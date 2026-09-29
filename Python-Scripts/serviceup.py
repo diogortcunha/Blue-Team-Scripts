@@ -1,181 +1,171 @@
 #!/usr/bin/env python3
 
-#Made By 1one0zero
+"""Watch service states and alert (and optionally restart) when a running service stops.
 
-#This script is a cross-platform system integrity monitoring tool that tracks changes to specified files and directories on Linux and Windows systems. Its key features include:
+Linux uses systemd, Windows uses ``sc``. Only transitions from running to stopped/failed
+raise an alert, so one-shot units that finish normally are not reported as stopped.
+``--restart ask`` prompts on a terminal, ``auto`` restarts immediately and ``never``
+only reports. With ``--once`` the current failed/stopped auto-start services are listed.
+"""
 
-    #OS Detection: Automatically identifies the operating system and uses appropriate methods for monitoring.
-    #Linux Monitoring:
-        #Uses the pyinotify library to detect events such as file modifications, creations, deletions, and attribute changes.
-        #Supports monitoring both individual files and directories (recursively).
-    #Windows Monitoring:
-        #Uses pywin32 to track changes in directories, including file creation, deletion, modification, renaming, and attribute changes.
-        #Limited to directory monitoring (not individual files).
-    #Customizable Monitoring List:
-        #Predefined sensitive files and directories (e.g., /etc/passwd, /etc/ssh/sshd_config).
-        #Alerts users with details about the type of change, the affected file/directory, and its path.
+from __future__ import annotations
 
-#This tool is ideal for system administrators or security professionals who need to detect unauthorized changes to critical system files or configurations in real-time.
-#Usage of this script has no responsibiity on its creator, use at your own risk.
-
-import os
-import time
-import platform
-import subprocess
+import json
 import re
+import sys
+import time
+from fnmatch import fnmatch
 
-def get_os():
-    """
-    Detect the operating system.
-    Returns:
-        str: 'Windows' or 'Linux'
-    """
-    return platform.system()
+from btcommon import IS_LINUX, IS_WINDOWS, Allowlist, Report, hostname, make_parser, now_iso, powershell_json, run
 
-def get_all_services_windows():
-    """
-    Get a dictionary of all Windows services and their statuses.
-    Returns:
-        dict: {service_name: status}
-    """
-    cmd = 'sc query state= all'
-    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, shell=True)
-    output = result.stdout
-    services = {}
-    service_name = ''
+RUNNING = {"active", "running", "reloading", "activating"}
+STOPPED = {"inactive", "failed", "stopped", "stop_pending", "paused", "deactivating"}
+
+
+def parse_systemctl_units(output: str) -> dict[str, str]:
+    """Parse ``systemctl list-units --plain --no-legend`` into {unit: ACTIVE state}."""
+    services: dict[str, str] = {}
+    for line in output.splitlines():
+        parts = line.replace("●", " ").split()
+        if len(parts) >= 3 and parts[0].endswith(".service"):
+            services[parts[0]] = parts[2].lower()
+    return services
+
+
+def parse_sc_query(output: str) -> dict[str, str]:
+    services: dict[str, str] = {}
+    name = ""
     for line in output.splitlines():
         line = line.strip()
-        if line.startswith('SERVICE_NAME:'):
-            service_name = line.split(':',1)[1].strip()
-        elif line.startswith('STATE'):
-            # STATE              : 4  RUNNING
-            parts = line.split(':',1)[1].strip().split()
+        if line.startswith("SERVICE_NAME:"):
+            name = line.split(":", 1)[1].strip()
+        elif line.startswith("STATE") and name:
+            parts = line.split(":", 1)[1].split()
             if len(parts) >= 2:
-                state_code = parts[0]
-                state_text = parts[1]
-                services[service_name] = state_text
+                services[name] = parts[1].lower()
     return services
 
-def start_service_windows(service_name):
-    """
-    Start a Windows service.
-    Args:
-        service_name (str): Name of the service.
-    Returns:
-        bool: True if started successfully, False otherwise.
-    """
-    cmd = f'sc start "{service_name}"'
-    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, shell=True)
-    return result.returncode == 0
 
-def get_all_services_linux():
-    """
-    Get a dictionary of all Linux services and their statuses.
-    Returns:
-        dict: {service_name: status}
-    """
-    cmd = 'systemctl list-units --type=service --all --no-pager --no-legend'
-    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, shell=True)
-    output = result.stdout.strip()
-    services = {}
-    for line in output.split('\n'):
-        if line.strip():
-            # Each line contains: UNIT LOAD ACTIVE SUB DESCRIPTION
-            parts = line.split()
-            if len(parts) >= 4:
-                service_name = parts[0]
-                load = parts[1]
-                active = parts[2]
-                services[service_name] = active
-    return services
+def get_services() -> dict[str, str]:
+    if IS_WINDOWS:
+        return parse_sc_query(run(["sc", "query", "type=", "service", "state=", "all"]).stdout)
+    result = run(["systemctl", "list-units", "--type=service", "--all", "--plain", "--no-legend", "--no-pager"])
+    return parse_systemctl_units(result.stdout)
 
-def start_service_linux(service_name):
-    """
-    Start a Linux service.
-    Args:
-        service_name (str): Name of the service.
-    Returns:
-        bool: True if started successfully, False otherwise.
-    """
-    cmd = f'sudo systemctl start {service_name}'
-    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, shell=True)
-    return result.returncode == 0
 
-def get_service_terminator(service_name, os_type):
-    """
-    Attempt to find out who stopped the service.
-    Args:
-        service_name (str): Name of the service.
-        os_type (str): Operating system type.
-    Returns:
-        str: Username of the person who terminated the service, or 'Unknown User'.
-    """
-    if os_type == 'Linux':
-        cmd = f'journalctl _SYSTEMD_UNIT={service_name} -n 50'
-        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, shell=True)
-        output = result.stdout
-        matches = re.findall(r'Stopped\s+.*\s+by\s+user\s+(\w+)', output)
-        if matches:
-            return matches[-1]
-    # For Windows or if no match found
-    return "Unknown User"
+def start_service(name: str) -> tuple[bool, str]:
+    result = run(["sc", "start", name]) if IS_WINDOWS else run(["systemctl", "start", name])
+    return result.ok, result.stderr or result.stdout
 
-def monitor_services():
-    """
-    Monitor all services and prompt the user if any service stops.
-    """
-    os_type = get_os()
-    if os_type == 'Windows':
-        get_all_services = get_all_services_windows
-        start_service = start_service_windows
-    elif os_type == 'Linux':
-        get_all_services = get_all_services_linux
-        start_service = start_service_linux
+
+def who_stopped(name: str) -> str:
+    """Best effort: find a recent sudo/systemctl/sc command that stopped this service."""
+    if IS_LINUX:
+        unit = name.removesuffix(".service")
+        result = run(["journalctl", "--no-pager", "-q", "-o", "cat", "--since", "-10min", "_COMM=sudo"])
+        for line in reversed(result.stdout.splitlines()):
+            if "COMMAND=" in line and re.search(rf"\b(stop|kill|disable|mask)\b.*\b{re.escape(unit)}\b", line):
+                user = line.split(":", 1)[0].strip()
+                return f"{user} ({line.split('COMMAND=', 1)[1].strip()})"
+        return "unknown (enable auditd or check journalctl -u " + name + ")"
+    if IS_WINDOWS:
+        rows, _ = powershell_json(
+            "Get-WinEvent -FilterHashtable @{LogName='System'; Id=7036,7040; StartTime=(Get-Date).AddMinutes(-10)} "
+            "-MaxEvents 50 -ErrorAction SilentlyContinue | Select-Object Id,UserId,Message"
+        )
+        for row in rows:
+            if name.lower() in (row.get("Message") or "").lower() and row.get("UserId"):
+                return str(row["UserId"])
+    return "unknown"
+
+
+def selected(name: str, only: list[str], ignore: list[str]) -> bool:
+    if only and not any(fnmatch(name, pattern) for pattern in only):
+        return False
+    return not any(fnmatch(name, pattern) for pattern in ignore)
+
+
+_allowlist: Allowlist | None = None
+
+
+def alert(args, severity: str, message: str, **data) -> None:
+    global _allowlist
+    if _allowlist is None:
+        _allowlist = Allowlist.load(getattr(args, "allowlist", None) or [])
+    reason = _allowlist.match("serviceup", "services", message) if severity != "info" else None
+    if reason:
+        severity, message, data = "info", f"{message}  (allowlisted: {reason})", {**data, "allowlisted": reason}
+    if args.json:
+        print(json.dumps({"tool": "serviceup", "host": hostname(), "timestamp": now_iso(), "severity": severity, "message": message, **data}), flush=True)
     else:
-        print("Unsupported OS")
+        print(f"{now_iso()} [{severity.upper()}] {message}", flush=True)
+
+
+def handle_stop(args, name: str, old: str, new: str) -> None:
+    culprit = who_stopped(name)
+    alert(args, "medium", f"service {name} went from {old} to {new} (stopped by: {culprit})", service=name, old=old, new=new, stopped_by=culprit)
+    mode = args.restart
+    if mode == "ask":
+        if not sys.stdin.isatty():
+            return
+        answer = input(f"Restart {name}? [y/N] ").strip().lower()
+        if answer not in {"y", "yes", "s", "sim"}:
+            return
+    elif mode == "never":
         return
+    ok, output = start_service(name)
+    alert(args, "info" if ok else "high", f"restart of {name} {'succeeded' if ok else 'FAILED: ' + output}", service=name, restarted=ok)
 
-    # Get initial list of services and their statuses
-    services_status = get_all_services()
-    previous_status = services_status.copy()
 
-    print(f"Monitoring all services ({len(services_status)} services detected)...\n")
+def main() -> int:
+    parser = make_parser("Monitor services and alert when running services stop.")
+    parser.add_argument("--interval", type=float, default=5.0, help="Seconds between checks (default: 5)")
+    parser.add_argument("--restart", choices=["ask", "auto", "never"], default="ask", help="What to do when a service stops (default: ask)")
+    parser.add_argument("--only", action="append", default=[], metavar="GLOB", help="Only watch matching services (repeatable)")
+    parser.add_argument("--ignore", action="append", default=[], metavar="GLOB", help="Ignore matching services (repeatable)")
+    parser.add_argument("--once", action="store_true", help="List failed services once and exit")
+    args = parser.parse_args()
 
+    if not (IS_LINUX or IS_WINDOWS):
+        print("error: serviceup supports Linux (systemd) and Windows only", file=sys.stderr)
+        return 2
+
+    previous = {n: s for n, s in get_services().items() if selected(n, args.only, args.ignore)}
+    if not previous:
+        print("error: no services found (is systemd running?)", file=sys.stderr)
+        return 2
+
+    if args.once:
+        report = Report("serviceup", args)
+        for name, state in sorted(previous.items()):
+            if state == "failed":
+                report.add("failed services", "medium", f"{name} is {state}", service=name, state=state)
+        report.info("services", f"{len(previous)} service(s), {sum(1 for s in previous.values() if s in RUNNING)} running")
+        return report.emit()
+
+    print(f"Watching {len(previous)} services every {args.interval}s (restart={args.restart}). Ctrl-C to stop.", file=sys.stderr)
     try:
         while True:
-            services_status = get_all_services()
-            # Clear the console
-            os.system('cls' if os.name == 'nt' else 'clear')
-            # Print out the status of all services
-            print(f"{'Service Name':<50} {'Status':<10}")
-            print('-'*60)
-            for service, status in sorted(services_status.items()):
-                print(f"{service:<50} {status:<10}")
-            # Compare current statuses with previous statuses
-            for service, status in services_status.items():
-                prev_status = previous_status.get(service, None)
-                if prev_status != status:
-                    if status.lower() in ["stopped", "inactive", "failed", "stop_pending", "paused"]:
-                        # Service has stopped
-                        terminator = get_service_terminator(service, os_type)
-                        print(f"\nService '{service}' has been terminated by {terminator}.")
-                        response = input(f"Do you want to restart '{service}'? (yes/no): ").strip().lower()
-                        if response == 'yes':
-                            success = start_service(service)
-                            if success:
-                                print(f"Service '{service}' has been started.")
-                                previous_status[service] = status
-                            else:
-                                print(f"Failed to start service '{service}'.")
-                        else:
-                            print(f"Service '{service}' will remain stopped.")
-                            previous_status[service] = status
-                    else:
-                        print(f"\nService '{service}' status changed from '{prev_status}' to '{status}'.")
-                        previous_status[service] = status
-            time.sleep(5)
+            time.sleep(args.interval)
+            current = {n: s for n, s in get_services().items() if selected(n, args.only, args.ignore)}
+            for name, state in sorted(current.items()):
+                old = previous.get(name)
+                if old is None or old == state:
+                    continue
+                if old in RUNNING and state in STOPPED:
+                    handle_stop(args, name, old, state)
+                    state = get_services().get(name, state)
+                elif state == "failed":
+                    alert(args, "medium", f"service {name} failed (was {old})", service=name, old=old, new=state)
+                current[name] = state
+            for name in sorted(set(previous) - set(current)):
+                if previous[name] in RUNNING:
+                    alert(args, "low", f"service {name} disappeared", service=name)
+            previous = current
     except KeyboardInterrupt:
-        print("\nMonitoring stopped by user.")
+        print("\nMonitoring stopped by user.", file=sys.stderr)
+    return 0
+
 
 if __name__ == "__main__":
-    monitor_services()
+    raise SystemExit(main())

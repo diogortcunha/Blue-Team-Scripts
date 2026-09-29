@@ -4,91 +4,64 @@
 
 from __future__ import annotations
 
-import argparse
-import csv
-import platform
-import subprocess
-from dataclasses import dataclass
+from btcommon import Process, Report, compile_patterns, first_match, list_processes, load_rules, make_parser, normalize_name
 
 
-SUSPICIOUS_NAMES = {
-    "powershell",
-    "cmd.exe",
-    "wscript.exe",
-    "cscript.exe",
-    "mshta.exe",
-    "rundll32.exe",
-    "regsvr32.exe",
-    "curl",
-    "wget",
-    "nc",
-    "ncat",
-    "netcat",
-    "python",
-    "python3",
-}
-
-
-@dataclass
-class ProcessRow:
-    pid: str
-    ppid: str
-    user: str
-    name: str
-    cpu: str
-    mem: str
-
-
-def run(cmd: list[str]) -> str:
-    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
-    return result.stdout.strip() or result.stderr.strip()
-
-
-def linux_processes() -> list[ProcessRow]:
-    output = run(["ps", "-eo", "pid=,ppid=,user=,comm=,%cpu=,%mem=", "--sort=-%cpu"])
-    rows: list[ProcessRow] = []
-    for line in output.splitlines():
-        parts = line.split(None, 5)
-        if len(parts) == 6:
-            rows.append(ProcessRow(*parts))
-    return rows
-
-
-def windows_processes() -> list[ProcessRow]:
-    output = run(["tasklist", "/fo", "csv", "/v"])
-    rows: list[ProcessRow] = []
-    for row in csv.DictReader(output.splitlines()):
-        rows.append(
-            ProcessRow(
-                pid=row.get("PID", ""),
-                ppid="",
-                user=row.get("User Name", ""),
-                name=row.get("Image Name", ""),
-                cpu=row.get("CPU Time", ""),
-                mem=row.get("Mem Usage", ""),
-            )
-        )
-    return rows
-
-
-def suspicious(row: ProcessRow) -> bool:
-    name = row.name.lower()
-    return any(token in name for token in SUSPICIOUS_NAMES)
+def classify(proc: Process, names: set[str], patterns: list) -> tuple[str, str] | None:
+    """Return (severity, reason) when the process looks suspicious."""
+    matched = first_match(proc.cmdline, patterns) if proc.cmdline else None
+    if matched:
+        return "high", f"command line matches {matched!r}"
+    if normalize_name(proc.name) in names:
+        return "medium", "tool often abused by attackers"
+    return None
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="List running processes and flag suspicious names.")
-    parser.add_argument("--limit", type=int, default=25, help="Number of rows to print")
+    parser = make_parser("List running processes and flag suspicious names and command lines.")
+    parser.add_argument("--limit", type=int, default=25, help="Number of top processes to list (default: 25)")
     args = parser.parse_args()
+    report = Report("process_monitor", args)
 
-    rows = windows_processes() if platform.system() == "Windows" else linux_processes()
-    print(f"Top {min(args.limit, len(rows))} processes")
-    print(f"{'PID':<8} {'PPID':<8} {'USER':<18} {'CPU':<8} {'MEM':<10} NAME")
-    print("-" * 80)
-    for row in rows[: args.limit]:
-        flag = " !" if suspicious(row) else ""
-        print(f"{row.pid:<8} {row.ppid:<8} {row.user[:18]:<18} {row.cpu:<8} {row.mem:<10} {row.name}{flag}")
-    return 0
+    rules = load_rules("process_monitor", args.rules)
+    names = {n.lower() for n in rules.get("suspicious_names", [])}
+    patterns = compile_patterns(load_rules("commands", args.rules).get("patterns", []))
+
+    procs, error = list_processes()
+    if error:
+        report.error(error)
+    if not procs:
+        report.fail("could not list processes")
+        return report.emit()
+
+    procs.sort(key=lambda p: (p.cpu or 0, p.mem or 0), reverse=True)
+    for proc in procs[: args.limit]:
+        report.info(
+            "top processes",
+            f"{proc.pid:<7} {proc.ppid if proc.ppid is not None else '':<7} {proc.user[:16]:<16} "
+            f"cpu={proc.cpu if proc.cpu is not None else '-':<5} mem={proc.mem if proc.mem is not None else '-':<6} "
+            f"{proc.cmdline[:120] or proc.name}",
+            pid=proc.pid,
+            name=proc.name,
+        )
+
+    for proc in procs:
+        hit = classify(proc, names, patterns)
+        if hit:
+            severity, reason = hit
+            report.add(
+                "suspicious processes",
+                severity,
+                f"pid {proc.pid} ({proc.name}) user={proc.user or '?'}: {reason}: {proc.cmdline[:200]}",
+                pid=proc.pid,
+                ppid=proc.ppid,
+                name=proc.name,
+                user=proc.user,
+                cmdline=proc.cmdline,
+                exe=proc.exe,
+                reason=reason,
+            )
+    return report.emit()
 
 
 if __name__ == "__main__":
